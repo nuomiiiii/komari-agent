@@ -34,6 +34,14 @@ jobs:
               ? context.payload.release
               : (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
 
+            if (release.body?.trim()) {
+              await core.summary
+                .addHeading("Release Notes")
+                .addRaw(`Kept the existing release notes for ${tag}.`)
+                .write();
+              return;
+            }
+
             const generated = await github.request(
               "POST /repos/{owner}/{repo}/releases/generate-notes",
               {

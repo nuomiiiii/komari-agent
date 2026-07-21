@@ -102,16 +102,7 @@ func TestBuildTaskCommandWritesUtf8BomWindows(t *testing.T) {
 	}
 
 	scriptFile := cmd.Args[len(cmd.Args)-1]
-	file, err := filepath.Abs(scriptFile)
-	if err != nil {
-		t.Fatalf("failed to resolve script path: %v", err)
-	}
-
-	f, err := filepath.EvalSymlinks(file)
-	if err != nil {
-		t.Fatalf("failed to evaluate script path: %v", err)
-	}
-	contents, err := os.ReadFile(f)
+	contents, err := os.ReadFile(scriptFile)
 	if err != nil {
 		t.Fatalf("failed to read script file: %v", err)
 	}

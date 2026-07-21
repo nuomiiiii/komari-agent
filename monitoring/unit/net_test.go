@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/komari-monitor/komari-agent/runtimeconfig"
 )
 
 func TestConnectionsCount(t *testing.T) {
@@ -229,8 +231,9 @@ func TestNetworkSpeedFallback(t *testing.T) {
 }
 
 func TestNetworkSpeedWithoutMonthRotate(t *testing.T) {
-
-	flags.MonthRotate = 1
+	originalMonthRotate := runtimeconfig.MonthRotateDay()
+	t.Cleanup(func() { runtimeconfig.SetMonthRotateDay(originalMonthRotate) })
+	runtimeconfig.SetMonthRotateDay(0)
 
 	// 设置测试值
 	flags.IncludeNics = ""
@@ -248,18 +251,21 @@ func TestNetworkSpeedWithoutMonthRotate(t *testing.T) {
 func TestNetworkSpeedWithMonthRotate(t *testing.T) {
 	// 保存原始值
 	originalMonthRotate := flags.MonthRotate
+	originalRuntimeMonthRotate := runtimeconfig.MonthRotateDay()
 	originalIncludeNics := flags.IncludeNics
 	originalExcludeNics := flags.ExcludeNics
 
 	// 恢复原始值
 	defer func() {
 		flags.MonthRotate = originalMonthRotate
+		runtimeconfig.SetMonthRotateDay(originalRuntimeMonthRotate)
 		flags.IncludeNics = originalIncludeNics
 		flags.ExcludeNics = originalExcludeNics
 	}()
 
 	// 设置测试值 - 启用月重置
 	flags.MonthRotate = 1
+	runtimeconfig.SetMonthRotateDay(1)
 	flags.IncludeNics = ""
 	flags.ExcludeNics = ""
 
@@ -277,18 +283,21 @@ func TestNetworkSpeedWithMonthRotate(t *testing.T) {
 func TestNetworkSpeedWithNicFilters(t *testing.T) {
 	// 保存原始值
 	originalMonthRotate := flags.MonthRotate
+	originalRuntimeMonthRotate := runtimeconfig.MonthRotateDay()
 	originalIncludeNics := flags.IncludeNics
 	originalExcludeNics := flags.ExcludeNics
 
 	// 恢复原始值
 	defer func() {
 		flags.MonthRotate = originalMonthRotate
+		runtimeconfig.SetMonthRotateDay(originalRuntimeMonthRotate)
 		flags.IncludeNics = originalIncludeNics
 		flags.ExcludeNics = originalExcludeNics
 	}()
 
 	// 测试排除回环接口
 	flags.MonthRotate = 0
+	runtimeconfig.SetMonthRotateDay(0)
 	flags.IncludeNics = ""
 	flags.ExcludeNics = "lo,docker0"
 

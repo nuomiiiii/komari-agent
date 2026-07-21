@@ -17,6 +17,7 @@ import (
 	"github.com/komari-monitor/komari-agent/dnsresolver"
 	"github.com/komari-monitor/komari-agent/monitoring/netstatic"
 	monitoring "github.com/komari-monitor/komari-agent/monitoring/unit"
+	"github.com/komari-monitor/komari-agent/runtimeconfig"
 	"github.com/komari-monitor/komari-agent/server"
 	"github.com/komari-monitor/komari-agent/update"
 	"github.com/spf13/cobra"
@@ -45,9 +46,10 @@ var RootCmd = &cobra.Command{
 		if flags.ProtocolVersion == 0 {
 			flags.ProtocolVersion = 2
 		}
-		if flags.PreferIPVersion != "" && flags.PreferIPVersion != "4" && flags.PreferIPVersion != "6" {
-			return fmt.Errorf("invalid --prefer-ip-version value %q: expected 4 or 6", flags.PreferIPVersion)
+		if err := validateRuntimeConfig(flags); err != nil {
+			return err
 		}
+		runtimeconfig.SetMonthRotateDay(flags.MonthRotate)
 		// 捕获中止信号，优雅退出
 		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -132,6 +134,31 @@ var RootCmd = &cobra.Command{
 			server.EstablishWebSocketConnection()
 		}
 	},
+}
+
+func validateRuntimeConfig(config *pkg_flags.Config) error {
+	if config.Interval <= 0 {
+		return fmt.Errorf("invalid reporting interval %v: expected a value greater than 0", config.Interval)
+	}
+	if config.ReconnectInterval <= 0 {
+		return fmt.Errorf("invalid reconnect interval %d: expected a value greater than 0", config.ReconnectInterval)
+	}
+	if config.InfoReportInterval <= 0 {
+		return fmt.Errorf("invalid info report interval %d: expected a value greater than 0", config.InfoReportInterval)
+	}
+	if config.MaxRetries < 0 {
+		return fmt.Errorf("invalid max retries %d: expected a non-negative value", config.MaxRetries)
+	}
+	if config.MonthRotate < 0 || config.MonthRotate > 31 {
+		return fmt.Errorf("invalid month rotate day %d: expected 0 or a day from 1 to 31", config.MonthRotate)
+	}
+	if config.ProtocolVersion != 1 && config.ProtocolVersion != 2 {
+		return fmt.Errorf("invalid protocol version %d: expected 1 or 2", config.ProtocolVersion)
+	}
+	if config.PreferIPVersion != "" && config.PreferIPVersion != "4" && config.PreferIPVersion != "6" {
+		return fmt.Errorf("invalid preferred IP version %q: expected 4 or 6", config.PreferIPVersion)
+	}
+	return nil
 }
 
 func Execute() {

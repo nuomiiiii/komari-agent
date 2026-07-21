@@ -30,15 +30,16 @@ Dockerfile:
 - The Dockerfile expects prebuilt Linux binaries named
   `komari-agent-${TARGETOS}-${TARGETARCH}` in the Docker build context.
 
-The agent version is embedded with:
+The agent version and update repository are embedded with:
 
 ```sh
--ldflags="-X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION}"
+-ldflags="-X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari-agent/update.Repo=${GITHUB_REPOSITORY}"
 ```
 
 Do not remove this without changing the agent update and reporting logic. The
 agent uses `update.CurrentVersion` for update checks and reports it as part of
-basic info.
+basic info. Embedding `update.Repo` keeps fork builds on the fork's releases even
+if the source default changes during an upstream merge.
 
 Prefer `go-version-file: go.mod` for release-producing workflows so Actions uses
 the Go version declared by the project.

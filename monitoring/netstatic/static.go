@@ -298,11 +298,11 @@ func GetNetStatic() (*NetStatic, error) {
 
 // StartOrContinue 开始或继续流量统计
 func StartOrContinue() error {
+	mu.Lock()
+	defer mu.Unlock()
 	if running {
 		return nil
 	}
-	mu.Lock()
-	defer mu.Unlock()
 	ensureInitLocked()
 	// 读取历史
 	if err := loadFromFileLocked(); err != nil {

@@ -24,10 +24,13 @@ import (
 )
 
 var (
-	v2AckMu       sync.Mutex
-	v2AckEventIDs []string
-	v2SeenEvents  = make(map[string]struct{})
+	v2AckMu        sync.Mutex
+	v2AckEventIDs  []string
+	v2SeenEvents   = make(map[string]struct{})
+	v2SeenEventIDs []string
 )
+
+const v2SeenEventLimit = 512
 
 func EstablishWebSocketConnection() {
 	var conn *ws.SafeConn
@@ -223,7 +226,7 @@ func runV2PullLoop(ctx context.Context, errCh chan<- error) {
 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
 		ackIDs := snapshotV2AckEventIDs()
 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
-			"capabilities":  []string{"exec", "ping", "message", "event", "terminal"},
+			"capabilities":  []string{"exec", "ping", "message", "event", "terminal", "config"},
 			"ack_event_ids": ackIDs,
 		})
 		resp, err := postV2RequestContext(ctx, payload)
@@ -350,7 +353,28 @@ func markV2EventSeen(id string) bool {
 		return false
 	}
 	v2SeenEvents[id] = struct{}{}
+	v2SeenEventIDs = append(v2SeenEventIDs, id)
+	if len(v2SeenEventIDs) > v2SeenEventLimit {
+		oldest := v2SeenEventIDs[0]
+		v2SeenEventIDs = v2SeenEventIDs[1:]
+		delete(v2SeenEvents, oldest)
+	}
 	return true
+}
+
+func forgetV2Event(id string) {
+	if id == "" {
+		return
+	}
+	v2AckMu.Lock()
+	defer v2AckMu.Unlock()
+	delete(v2SeenEvents, id)
+	for i, seenID := range v2SeenEventIDs {
+		if seenID == id {
+			v2SeenEventIDs = append(v2SeenEventIDs[:i], v2SeenEventIDs[i+1:]...)
+			break
+		}
+	}
 }
 
 func connectWebSocket(websocketEndpoint string) (*ws.SafeConn, error) {
@@ -453,6 +477,19 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		} else {
 			log.Printf("bad v2 terminal params: %v", err)
 		}
+	case v2.MethodAgentConfig:
+		var p v2.ConfigParams
+		if err := v2.BindParams(params, &p); err != nil {
+			forgetV2Event(eventID)
+			log.Printf("bad v2 config params: %v", err)
+			return false
+		}
+		if err := applyRuntimeConfig(p); err != nil {
+			forgetV2Event(eventID)
+			log.Printf("failed to apply v2 config: %v", err)
+			return false
+		}
+		return true
 	case v2.MethodAgentMessage, v2.MethodAgentEvent:
 		log.Printf("received v2 %s: %+v", method, params)
 		return true

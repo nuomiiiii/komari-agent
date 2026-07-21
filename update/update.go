@@ -20,7 +20,7 @@ import (
 
 var (
 	CurrentVersion string = "0.0.1"
-	Repo           string = "komari-monitor/komari-agent"
+	Repo           string = "nuomiiiii/komari-agent"
 )
 
 const (
@@ -240,8 +240,9 @@ func selfUpdateReleaseFromSnapshot(owner, repo string, candidate snapshotRelease
 }
 
 func DoUpdateWorks() {
-	ticker_ := time.NewTicker(time.Duration(6) * time.Hour)
-	for range ticker_.C {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
 		CheckAndUpdate()
 	}
 }

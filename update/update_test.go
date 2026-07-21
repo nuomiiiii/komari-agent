@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+func TestDefaultUpdateRepo(t *testing.T) {
+	if Repo != "nuomiiiii/komari-agent" {
+		t.Fatalf("Repo = %q, want %q", Repo, "nuomiiiii/komari-agent")
+	}
+}
+
 // TestParseVersion 验证 parseVersion 能够解析各种版本号格式，包括带 v/V 前缀、预发布和构建元数据
 func TestParseVersion(t *testing.T) {
 	tests := []struct {

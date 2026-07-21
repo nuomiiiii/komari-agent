@@ -22,6 +22,7 @@ var flags = pkg_flags.GlobalConfig
 
 func DoUploadBasicInfoWorks() {
 	ticker := time.NewTicker(time.Duration(flags.InfoReportInterval) * time.Minute)
+	defer ticker.Stop()
 	for range ticker.C {
 		err := uploadBasicInfo()
 		if err != nil {
@@ -135,12 +136,12 @@ func tryUploadDataWithProtocol(data map[string]interface{}, protocolVersion int)
 	if resp.StatusCode != http.StatusOK {
 		return &httpStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: message}
 	}
-	if protocolVersion >= 2 {
-		if len(bytes.TrimSpace(respBody)) > 0 {
-			if _, err := parseV2Response(respBody); err != nil {
-				return err
-			}
+	if len(bytes.TrimSpace(respBody)) > 0 {
+		if err := processBasicInfoResponse(respBody, protocolVersion); err != nil {
+			return err
 		}
+	}
+	if protocolVersion >= 2 {
 		resetV2ProtocolFailures(protocolVersion)
 	}
 

@@ -18,6 +18,7 @@ const (
 	MethodAgentMessage    = "agent.message"
 	MethodAgentEvent      = "agent.event"
 	MethodAgentTerminal   = "agent.terminal.request"
+	MethodAgentConfig     = "agent.config"
 	MethodAgentPull       = "agent.pull"
 )
 
@@ -52,6 +53,10 @@ type Event struct {
 type EventResult struct {
 	Status string  `json:"status,omitempty"`
 	Events []Event `json:"events,omitempty"`
+}
+
+type ConfigParams struct {
+	MonthRotate int `json:"month_rotate"`
 }
 
 func NewNotification(method string, params interface{}) []byte {

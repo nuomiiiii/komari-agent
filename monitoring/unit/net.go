@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari-agent/monitoring/netstatic"
+	"github.com/komari-monitor/komari-agent/runtimeconfig"
 	"github.com/komari-monitor/komari-agent/utils"
 	"github.com/shirou/gopsutil/v4/net"
 )
@@ -221,11 +222,12 @@ func NetworkSpeed() (totalUp, totalDown, upSpeed, downSpeed uint64, err error) {
 	excludeNics := parseNics(flags.ExcludeNics)
 
 	// 如果设置了月重置（非0），统计totalUp、totalDown
-	if flags.MonthRotate != 0 {
+	resetDay := runtimeconfig.MonthRotateDay()
+	if resetDay != 0 {
 		netstatic.StartOrContinue() // 确保netstatic在运行
 		now := uint64(time.Now().Unix())
-		resetDay := uint64(utils.GetLastResetDate(flags.MonthRotate, time.Now()).Unix())
-		nicStatics, err := netstatic.GetTotalTrafficBetween(resetDay, now)
+		resetTimestamp := uint64(utils.GetLastResetDate(resetDay, time.Now()).Unix())
+		nicStatics, err := netstatic.GetTotalTrafficBetween(resetTimestamp, now)
 		if err != nil {
 			// 如果netstatic失败，回退到原来的方法，并返回额外的错误信息
 			fallbackUp, fallbackDown, fallbackUpSpeed, fallbackDownSpeed, fallbackErr := getNetworkSpeedFallback(includeNics, excludeNics)

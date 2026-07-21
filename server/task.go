@@ -343,8 +343,7 @@ func NewPingTask(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType, 
 	if protocolVersion >= 2 {
 		wsPayload = v2.BuildPingResultPayload(taskID, pingType, pingResult, finishedAt)
 	}
-	// https://github.com/komari-monitor/komari/commit/eb87a4fc330b7d1c407fa4ff70177615a4f50a1f
-	// -1 代表丢包，服务端计算
+	// -1 represents packet loss and is interpreted by the server.
 	//if pingResult == -1 {
 	//	return
 	//}
