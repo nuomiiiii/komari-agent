@@ -21,9 +21,11 @@ jobs:
     steps:
       - name: Generate and apply release notes
         uses: actions/github-script@v9
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         with:
           script: |
-            const tag = context.payload.release?.tag_name || core.getInput("tag");
+            const tag = process.env.RELEASE_TAG;
             if (!tag) {
               core.setFailed("No release tag was provided.");
               return;
