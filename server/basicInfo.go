@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
+	"github.com/komari-monitor/komari-agent/hostguard"
 	monitoring "github.com/komari-monitor/komari-agent/monitoring/unit"
 	"github.com/komari-monitor/komari-agent/protocol/transport"
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
@@ -44,22 +45,24 @@ func uploadBasicInfo() error {
 	osname := monitoring.OSName()
 	kernelVersion := monitoring.KernelVersion()
 	ipv4, ipv6, _ := monitoring.GetIPAddress()
+	hostguard.SetReportedAddresses(ipv4, ipv6)
 
 	data := map[string]interface{}{
-		"cpu_name":           cpu.CPUName,
-		"cpu_cores":          cpu.CPUCores,
-		"cpu_physical_cores": cpu.CPUPhysicalCores,
-		"arch":               cpu.CPUArchitecture,
-		"os":                 osname,
-		"kernel_version":     kernelVersion,
-		"ipv4":               ipv4,
-		"ipv6":               ipv6,
-		"mem_total":          monitoring.Ram().Total,
-		"swap_total":         monitoring.Swap().Total,
-		"disk_total":         monitoring.Disk().Total,
-		"gpu_name":           monitoring.GpuName(),
-		"virtualization":     monitoring.Virtualized(),
-		"version":            update.CurrentVersion,
+		"cpu_name":                 cpu.CPUName,
+		"cpu_cores":                cpu.CPUCores,
+		"cpu_physical_cores":       cpu.CPUPhysicalCores,
+		"arch":                     cpu.CPUArchitecture,
+		"os":                       osname,
+		"kernel_version":           kernelVersion,
+		"ipv4":                     ipv4,
+		"ipv6":                     ipv6,
+		"mem_total":                monitoring.Ram().Total,
+		"swap_total":               monitoring.Swap().Total,
+		"disk_total":               monitoring.Disk().Total,
+		"gpu_name":                 monitoring.GpuName(),
+		"virtualization":           monitoring.Virtualized(),
+		"version":                  update.CurrentVersion,
+		"remote_control_protected": hostguard.RemoteControlBlockedReason(flags.Endpoint) != "",
 	}
 
 	// 尝试上传完整数据
@@ -69,6 +72,7 @@ func uploadBasicInfo() error {
 		delete(data, "kernel_version")
 		// 兼容 <= 1.2.0
 		delete(data, "cpu_physical_cores")
+		delete(data, "remote_control_protected")
 		err = tryUploadData(data)
 		if err != nil {
 			return err

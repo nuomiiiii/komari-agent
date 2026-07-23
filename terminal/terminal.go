@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/komari-monitor/komari-agent/hostguard"
 
 	pkg_flags "github.com/komari-monitor/komari-agent/cmd/flags"
 )
@@ -35,6 +36,11 @@ func StartTerminal(conn *websocket.Conn) {
 		conn.Close()
 		return
 	}
+	if reason := hostguard.RemoteControlBlockedReason(flags.Endpoint); reason != "" {
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("\n\n"+reason+"\n"))
+		_ = conn.Close()
+		return
+	}
 	impl, err := newTerminalImpl()
 	if err != nil {
 		conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("Error: %v\r\n", err)))
@@ -58,14 +64,23 @@ func StartTerminal(conn *websocket.Conn) {
 	go handleTerminalOutput(conn, impl.term, errChan, done)
 
 	// 等待终端进程结束或出现错误
-	select {
-	case err := <-errChan:
-		// WebSocket 连接断开或出现错误
-		if err != nil {
-			conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("\r\nConnection error: %v\r\n", err)))
+	guardTicker := time.NewTicker(15 * time.Second)
+	defer guardTicker.Stop()
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("\r\nConnection error: %v\r\n", err)))
+			}
+			return
+		case <-done:
+			return
+		case <-guardTicker.C:
+			if reason := hostguard.RemoteControlBlockedReason(flags.Endpoint); reason != "" {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("\r\n"+reason+"\r\n"))
+				return
+			}
 		}
-	case <-done:
-		// 已经被其他地方关闭
 	}
 }
 

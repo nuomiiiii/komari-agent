@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
+	"github.com/komari-monitor/komari-agent/hostguard"
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 	"github.com/komari-monitor/komari-agent/ws"
 	ping "github.com/prometheus-community/pro-bing"
@@ -32,6 +33,10 @@ func NewTask(task_id, command string) {
 	}
 	if flags.DisableWebSsh {
 		uploadTaskResult(task_id, "Remote control is disabled.", -1, time.Now())
+		return
+	}
+	if reason := hostguard.RemoteControlBlockedReason(flags.Endpoint); reason != "" {
+		uploadTaskResult(task_id, reason, -1, time.Now())
 		return
 	}
 	log.Printf("Executing task %s with command: %s", task_id, command)

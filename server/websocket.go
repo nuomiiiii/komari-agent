@@ -226,7 +226,7 @@ func runV2PullLoop(ctx context.Context, errCh chan<- error) {
 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
 		ackIDs := snapshotV2AckEventIDs()
 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
-			"capabilities":  []string{"exec", "ping", "message", "event", "terminal", "config"},
+			"capabilities":  []string{"exec", "ping", "message", "event", "terminal", "files", "config"},
 			"ack_event_ids": ackIDs,
 		})
 		resp, err := postV2RequestContext(ctx, payload)
@@ -405,7 +405,8 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
 			Params  interface{} `json:"params,omitempty"`
 			Message string      `json:"message"`
 			// Terminal
-			TerminalId string `json:"request_id,omitempty"`
+			TerminalId   string `json:"request_id,omitempty"`
+			RemoteTicket string `json:"remote_ticket,omitempty"`
 			// Remote Exec
 			ExecCommand string `json:"command,omitempty"`
 			ExecTaskID  string `json:"task_id,omitempty"`
@@ -424,6 +425,10 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
 			continue
 		}
 
+		if message.Message == "remote" && message.TerminalId != "" && message.RemoteTicket != "" {
+			go establishRemoteConnection(flags.Token, message.TerminalId, message.RemoteTicket, flags.Endpoint)
+			continue
+		}
 		if message.Message == "terminal" || message.TerminalId != "" {
 			go establishTerminalConnection(flags.Token, message.TerminalId, flags.Endpoint)
 			continue
@@ -477,6 +482,14 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		} else {
 			log.Printf("bad v2 terminal params: %v", err)
 		}
+	case v2.MethodAgentRemote:
+		var p v2.RemoteRequestParams
+		if err := v2.BindParams(params, &p); err == nil && p.RequestID != "" && p.Ticket != "" {
+			go establishRemoteConnection(flags.Token, p.RequestID, p.Ticket, flags.Endpoint)
+			return true
+		} else {
+			log.Printf("bad v2 remote params: %v", err)
+		}
 	case v2.MethodAgentConfig:
 		var p v2.ConfigParams
 		if err := v2.BindParams(params, &p); err != nil {
@@ -527,6 +540,26 @@ func establishTerminalConnection(token, id, endpoint string) {
 	if conn != nil {
 		conn.Close()
 	}
+}
+
+func establishRemoteConnection(token, id, ticket, endpoint string) {
+	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/remote?id=" + id
+	endpoint = "ws" + strings.TrimPrefix(endpoint, "http")
+	if convertedEndpoint, err := utils.ConvertIDNToASCII(endpoint); err == nil {
+		endpoint = convertedEndpoint
+	} else {
+		log.Printf("Warning: Failed to convert remote WebSocket IDN to ASCII: %v", err)
+	}
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set("X-Komari-Remote-Ticket", ticket)
+	conn, _, err := newWSDialer().Dial(endpoint, headers)
+	if err != nil {
+		log.Println("Failed to establish remote connection:", err)
+		return
+	}
+	terminal.StartRemoteSession(conn)
+	_ = conn.Close()
 }
 
 // newWSDialer 构造统一的 WebSocket 拨号器（自定义解析、IPv4/IPv6 动态排序、可选 TLS 忽略）

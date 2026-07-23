@@ -1,0 +1,604 @@
+package terminal
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	maxFileTransferSize = int64(2 << 30)
+	maxFileChunkSize    = 384 << 10
+	downloadChunkSize   = 256 << 10
+)
+
+type fileRequest struct {
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	Path        string `json:"path,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	UploadID    string `json:"upload_id,omitempty"`
+	Data        string `json:"data,omitempty"`
+	SHA256      string `json:"sha256,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	Overwrite   bool   `json:"overwrite,omitempty"`
+	Recursive   bool   `json:"recursive,omitempty"`
+}
+
+type fileEntry struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Size       int64  `json:"size"`
+	Mode       string `json:"mode"`
+	ModifiedAt string `json:"modified_at"`
+	Directory  bool   `json:"directory"`
+	Symlink    bool   `json:"symlink"`
+	Hidden     bool   `json:"hidden"`
+	Protected  bool   `json:"protected"`
+}
+
+type uploadState struct {
+	mu        sync.Mutex
+	file      *os.File
+	tempPath  string
+	target    string
+	expected  int64
+	received  int64
+	overwrite bool
+	hash      hash.Hash
+}
+
+type fileResponseWriter interface {
+	writeJSON(value any) error
+}
+
+type fileManager struct {
+	writer  fileResponseWriter
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	uploads map[string]*uploadState
+}
+
+func newFileManager(writer fileResponseWriter) *fileManager {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &fileManager{writer: writer, ctx: ctx, cancel: cancel, uploads: make(map[string]*uploadState)}
+}
+
+func (manager *fileManager) close() {
+	manager.cancel()
+	manager.mu.Lock()
+	uploads := manager.uploads
+	manager.uploads = make(map[string]*uploadState)
+	manager.mu.Unlock()
+	for _, upload := range uploads {
+		upload.mu.Lock()
+		_ = upload.file.Close()
+		_ = os.Remove(upload.tempPath)
+		upload.mu.Unlock()
+	}
+}
+
+func isFileMessage(messageType string) bool {
+	return strings.HasPrefix(messageType, "file.")
+}
+
+func (manager *fileManager) handle(payload []byte) {
+	var request fileRequest
+	if err := json.Unmarshal(payload, &request); err != nil || request.ID == "" {
+		manager.respond(request, nil, errors.New("invalid file request"))
+		return
+	}
+	switch request.Type {
+	case "file.list":
+		manager.list(request)
+	case "file.mkdir":
+		manager.mkdir(request)
+	case "file.create":
+		manager.create(request)
+	case "file.rename":
+		manager.rename(request)
+	case "file.delete":
+		manager.remove(request)
+	case "file.upload.start":
+		manager.startUpload(request)
+	case "file.upload.chunk":
+		manager.uploadChunk(request)
+	case "file.upload.finish":
+		manager.finishUpload(request)
+	case "file.download":
+		go manager.download(request)
+	default:
+		manager.respond(request, nil, errors.New("unsupported file operation"))
+	}
+}
+
+func (manager *fileManager) respond(request fileRequest, data any, err error) {
+	response := map[string]any{
+		"type":      "file.response",
+		"id":        request.ID,
+		"operation": request.Type,
+		"ok":        err == nil,
+	}
+	if err != nil {
+		response["error"] = err.Error()
+	} else if data != nil {
+		response["data"] = data
+	}
+	_ = manager.writer.writeJSON(response)
+}
+
+func userHomeDirectory() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filesystemRoots()[0]
+	}
+	return home
+}
+
+func normalizeFilePath(value string) (string, error) {
+	if strings.ContainsRune(value, '\x00') {
+		return "", errors.New("invalid path")
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return filesystemRoots()[0], nil
+	}
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(filesystemRoots()[0], value)
+	}
+	return filepath.Clean(value), nil
+}
+
+func parentFilePath(path string) string {
+	cleaned := filepath.Clean(path)
+	parent := filepath.Dir(cleaned)
+	if parent == cleaned {
+		return ""
+	}
+	return parent
+}
+
+func isFilesystemRoot(path string) bool {
+	cleaned := filepath.Clean(path)
+	if filepath.Dir(cleaned) == cleaned {
+		return true
+	}
+	for _, root := range filesystemRoots() {
+		if strings.EqualFold(cleaned, filepath.Clean(root)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSQLiteName(path string) bool {
+	name := strings.ToLower(filepath.Base(path))
+	for _, suffix := range []string{".db", ".db3", ".sqlite", ".sqlite3", ".s3db", "-wal", "-shm", "-journal"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSQLiteFile(path string) bool {
+	if isSQLiteName(path) {
+		return true
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	header := make([]byte, 16)
+	if _, err := io.ReadFull(file, header); err != nil {
+		return false
+	}
+	return string(header) == "SQLite format 3\x00"
+}
+
+func ensureFileAllowed(path string) error {
+	if isSQLiteFile(path) {
+		return errors.New("SQLite database files are protected")
+	}
+	return nil
+}
+
+func directoryContainsSQLite(path string) error {
+	return filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if !entry.IsDir() && isSQLiteFile(current) {
+			return errors.New("directory contains a protected SQLite database")
+		}
+		return nil
+	})
+}
+
+func (manager *fileManager) list(request fileRequest) {
+	path, err := normalizeFilePath(request.Path)
+	if err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	result := make([]fileEntry, 0, len(entries))
+	for _, entry := range entries {
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			continue
+		}
+		fullPath := filepath.Join(path, entry.Name())
+		result = append(result, fileEntry{
+			Name:       entry.Name(),
+			Path:       fullPath,
+			Size:       info.Size(),
+			Mode:       info.Mode().String(),
+			ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
+			Directory:  entry.IsDir(),
+			Symlink:    entry.Type()&os.ModeSymlink != 0,
+			Hidden:     strings.HasPrefix(entry.Name(), "."),
+			Protected:  !entry.IsDir() && isSQLiteFile(fullPath),
+		})
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].Directory != result[right].Directory {
+			return result[left].Directory
+		}
+		return strings.ToLower(result[left].Name) < strings.ToLower(result[right].Name)
+	})
+	manager.respond(request, map[string]any{
+		"path":    path,
+		"parent":  parentFilePath(path),
+		"roots":   filesystemRoots(),
+		"entries": result,
+	}, nil)
+}
+
+func (manager *fileManager) mkdir(request fileRequest) {
+	path, err := normalizeFilePath(request.Path)
+	if err == nil {
+		err = ensureFileAllowed(path)
+	}
+	if err == nil {
+		err = os.Mkdir(path, 0o755)
+	}
+	manager.respond(request, nil, err)
+}
+
+func (manager *fileManager) create(request fileRequest) {
+	path, err := normalizeFilePath(request.Path)
+	if err == nil {
+		err = ensureFileAllowed(path)
+	}
+	if err == nil {
+		var file *os.File
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if file != nil {
+			err = errors.Join(err, file.Close())
+		}
+	}
+	manager.respond(request, nil, err)
+}
+
+func (manager *fileManager) rename(request fileRequest) {
+	source, err := normalizeFilePath(request.Path)
+	if err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	if isFilesystemRoot(source) {
+		manager.respond(request, nil, errors.New("filesystem roots cannot be renamed"))
+		return
+	}
+	destination, err := normalizeFilePath(request.Destination)
+	if err == nil {
+		err = ensureFileAllowed(source)
+	}
+	if err == nil {
+		err = ensureFileAllowed(destination)
+	}
+	if err == nil {
+		if info, statErr := os.Lstat(source); statErr != nil {
+			err = statErr
+		} else if info.IsDir() {
+			err = directoryContainsSQLite(source)
+		}
+	}
+	if err == nil {
+		if _, statErr := os.Lstat(destination); statErr == nil {
+			err = errors.New("destination already exists")
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			err = statErr
+		}
+	}
+	if err == nil {
+		err = os.Rename(source, destination)
+	}
+	manager.respond(request, nil, err)
+}
+
+func (manager *fileManager) remove(request fileRequest) {
+	path, err := normalizeFilePath(request.Path)
+	if err == nil && isFilesystemRoot(path) {
+		err = errors.New("filesystem roots cannot be deleted")
+	}
+	if err == nil {
+		err = ensureFileAllowed(path)
+	}
+	if err == nil {
+		if info, statErr := os.Lstat(path); statErr != nil {
+			err = statErr
+		} else if info.IsDir() {
+			err = directoryContainsSQLite(path)
+			if err == nil && !request.Recursive {
+				err = errors.New("directory deletion requires recursive confirmation")
+			}
+		}
+	}
+	if err == nil {
+		if request.Recursive {
+			err = os.RemoveAll(path)
+		} else {
+			err = os.Remove(path)
+		}
+	}
+	manager.respond(request, nil, err)
+}
+
+func newTransferID() (string, error) {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer), nil
+}
+
+func (manager *fileManager) startUpload(request fileRequest) {
+	target, err := normalizeFilePath(request.Path)
+	if err == nil {
+		err = validateUploadTarget(target, request.Overwrite)
+	}
+	if err == nil && (request.Size < 0 || request.Size > maxFileTransferSize) {
+		err = fmt.Errorf("file exceeds the %d byte transfer limit", maxFileTransferSize)
+	}
+	var tempFile *os.File
+	if err == nil {
+		tempFile, err = os.CreateTemp(filepath.Dir(target), ".komari-upload-*")
+	}
+	if err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	_ = tempFile.Chmod(0o600)
+	uploadID, err := newTransferID()
+	if err != nil {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+		manager.respond(request, nil, err)
+		return
+	}
+	manager.mu.Lock()
+	manager.uploads[uploadID] = &uploadState{
+		file: tempFile, tempPath: tempFile.Name(), target: target,
+		expected: request.Size, overwrite: request.Overwrite, hash: sha256.New(),
+	}
+	manager.mu.Unlock()
+	manager.respond(request, map[string]any{"upload_id": uploadID}, nil)
+}
+
+func (manager *fileManager) uploadChunk(request fileRequest) {
+	manager.mu.Lock()
+	upload := manager.uploads[request.UploadID]
+	manager.mu.Unlock()
+	if upload == nil {
+		manager.respond(request, nil, errors.New("upload session not found"))
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(request.Data)
+	if err == nil && len(data) > maxFileChunkSize {
+		err = errors.New("upload chunk is too large")
+	}
+	upload.mu.Lock()
+	if err == nil && upload.received+int64(len(data)) > upload.expected {
+		err = errors.New("upload exceeds declared size")
+	}
+	if err == nil {
+		_, err = upload.file.Write(data)
+	}
+	if err == nil {
+		upload.received += int64(len(data))
+		_, _ = upload.hash.Write(data)
+	}
+	received := upload.received
+	upload.mu.Unlock()
+	manager.respond(request, map[string]any{"received": received}, err)
+}
+
+func (manager *fileManager) finishUpload(request fileRequest) {
+	manager.mu.Lock()
+	upload := manager.uploads[request.UploadID]
+	delete(manager.uploads, request.UploadID)
+	manager.mu.Unlock()
+	if upload == nil {
+		manager.respond(request, nil, errors.New("upload session not found"))
+		return
+	}
+	upload.mu.Lock()
+	defer upload.mu.Unlock()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = upload.file.Close()
+			_ = os.Remove(upload.tempPath)
+		}
+	}()
+	if upload.received != upload.expected {
+		manager.respond(request, nil, errors.New("uploaded size does not match declared size"))
+		return
+	}
+	actualHash := hex.EncodeToString(upload.hash.Sum(nil))
+	if request.SHA256 != "" && !strings.EqualFold(request.SHA256, actualHash) {
+		manager.respond(request, nil, errors.New("uploaded file checksum mismatch"))
+		return
+	}
+	if err := upload.file.Sync(); err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	if err := upload.file.Close(); err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	if err := ensureFileAllowed(upload.tempPath); err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	if err := validateUploadTarget(upload.target, upload.overwrite); err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	if err := replaceUploadedFile(upload.tempPath, upload.target, upload.overwrite); err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	cleanup = false
+	manager.respond(request, map[string]any{"sha256": actualHash, "size": upload.received}, nil)
+}
+
+func replaceUploadedFile(tempPath, target string, overwrite bool) error {
+	if !overwrite || runtime.GOOS != "windows" {
+		return os.Rename(tempPath, target)
+	}
+	if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
+		return os.Rename(tempPath, target)
+	} else if err != nil {
+		return err
+	}
+	backupID, err := newTransferID()
+	if err != nil {
+		return err
+	}
+	backup := filepath.Join(filepath.Dir(target), ".komari-backup-"+backupID)
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, target); err != nil {
+		restoreErr := os.Rename(backup, target)
+		return errors.Join(err, restoreErr)
+	}
+	_ = os.Remove(backup)
+	return nil
+}
+
+func validateUploadTarget(target string, overwrite bool) error {
+	if err := ensureFileAllowed(target); err != nil {
+		return err
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("upload target must be a regular file")
+	}
+	if !overwrite {
+		return errors.New("destination already exists")
+	}
+	return nil
+}
+
+func (manager *fileManager) download(request fileRequest) {
+	path, err := normalizeFilePath(request.Path)
+	if err == nil {
+		err = ensureFileAllowed(path)
+	}
+	var file *os.File
+	var info os.FileInfo
+	if err == nil {
+		info, err = os.Lstat(path)
+	}
+	if err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		err = errors.New("only regular files can be downloaded")
+	}
+	if err == nil && info.Size() > maxFileTransferSize {
+		err = fmt.Errorf("file exceeds the %d byte transfer limit", maxFileTransferSize)
+	}
+	if err == nil {
+		file, err = os.Open(path)
+	}
+	if err != nil {
+		_ = manager.writer.writeJSON(map[string]any{
+			"type": "file.download.error", "id": request.ID, "error": err.Error(),
+		})
+		return
+	}
+	defer file.Close()
+	_ = manager.writer.writeJSON(map[string]any{
+		"type": "file.download.begin", "id": request.ID,
+		"name": filepath.Base(path), "size": info.Size(),
+	})
+	hasher := sha256.New()
+	buffer := make([]byte, downloadChunkSize)
+	sequence := 0
+	for {
+		select {
+		case <-manager.ctx.Done():
+			return
+		default:
+		}
+		count, readErr := file.Read(buffer)
+		if count > 0 {
+			_, _ = hasher.Write(buffer[:count])
+			if err := manager.writer.writeJSON(map[string]any{
+				"type": "file.download.chunk", "id": request.ID, "sequence": sequence,
+				"data": base64.StdEncoding.EncodeToString(buffer[:count]),
+			}); err != nil {
+				return
+			}
+			sequence++
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			_ = manager.writer.writeJSON(map[string]any{"type": "file.download.error", "id": request.ID, "error": readErr.Error()})
+			return
+		}
+	}
+	_ = manager.writer.writeJSON(map[string]any{
+		"type": "file.download.end", "id": request.ID,
+		"sha256": hex.EncodeToString(hasher.Sum(nil)),
+	})
+}
