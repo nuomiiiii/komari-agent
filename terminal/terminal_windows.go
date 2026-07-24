@@ -22,11 +22,8 @@ func newTerminalImpl() (*terminalImpl, error) {
 		return nil, fmt.Errorf("no supported shell found")
 	}
 
-	// 获取工作目录
-	workingDir := "."
-	if executable, err := os.Executable(); err == nil {
-		workingDir = filepath.Dir(executable)
-	}
+	// 远程 Shell 从当前账户主目录启动，与 SSH 等常规登录体验一致。
+	workingDir := terminalWorkingDirectory()
 
 	// 启动 ConPTY
 	tty, err := conpty.Start(shell, conpty.ConPtyWorkDir(workingDir))
@@ -44,6 +41,18 @@ func newTerminalImpl() (*terminalImpl, error) {
 			tty: tty,
 		},
 	}, nil
+}
+
+func terminalWorkingDirectory() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if info, statErr := os.Stat(home); statErr == nil && info.IsDir() {
+			return home
+		}
+	}
+	if executable, err := os.Executable(); err == nil {
+		return filepath.Dir(executable)
+	}
+	return "."
 }
 
 type windowsTerminal struct {

@@ -3,11 +3,22 @@
 package terminal
 
 import (
+	"os"
 	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestTerminalWorkingDirectoryUsesCurrentUserHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("current user home is unavailable: %v", err)
+	}
+	if got := terminalWorkingDirectory(); got != home {
+		t.Fatalf("expected terminal working directory %q, got %q", home, got)
+	}
+}
 
 func TestBuildMotdShellCommandUsesPOSIXShell(t *testing.T) {
 	const userShell = "/usr/bin/fish"

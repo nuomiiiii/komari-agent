@@ -67,6 +67,7 @@ func newTerminalImpl() (*terminalImpl, error) {
 	}
 
 	cmd := buildMotdShellCommand(shell)
+	cmd.Dir = terminalWorkingDirectory()
 	cmd.Env = append(os.Environ(), // 继承系统环境变量
 		"TERM=xterm-256color", // 设置终端类型，提高兼容性
 		"LANG=C.UTF-8",        // 设置语言环境为 UTF-8
@@ -77,6 +78,7 @@ func newTerminalImpl() (*terminalImpl, error) {
 	if err != nil {
 		// 回退到原始启动逻辑（直接启动 shell，再无参数）
 		cmd = exec.Command(shell)
+		cmd.Dir = terminalWorkingDirectory()
 		cmd.Env = append(os.Environ(),
 			"TERM=xterm-256color",
 			"LANG=C.UTF-8",
@@ -104,6 +106,17 @@ const motdShellPrelude = "for f in /etc/update-motd.d/*; do [ -e \"$f\" ] && [ -
 
 func buildMotdShellCommand(shell string) *exec.Cmd {
 	return exec.Command("/bin/sh", "-c", motdShellPrelude, "komari-motd", shell)
+}
+
+func terminalWorkingDirectory() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "/"
+	}
+	if info, statErr := os.Stat(home); statErr != nil || !info.IsDir() {
+		return "/"
+	}
+	return home
 }
 
 // unixTerminal 实现了 Unix 系统下的终端接口。
