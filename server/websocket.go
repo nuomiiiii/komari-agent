@@ -160,9 +160,9 @@ func EstablishWebSocketConnection() {
 }
 
 func buildWebSocketEndpoint(protocolVersion int) string {
-	path := "/api/clients/report?token=" + flags.Token
+	path := "/api/clients/report"
 	if protocolVersion >= 2 {
-		path = "/api/clients/v2/rpc?token=" + flags.Token
+		path = "/api/clients/v2/rpc"
 	}
 	websocketEndpoint := strings.TrimSuffix(flags.Endpoint, "/") + path
 	websocketEndpoint = "ws" + strings.TrimPrefix(websocketEndpoint, "http")
@@ -255,7 +255,7 @@ func postV2Request(payload []byte) (*v2.Response, error) {
 }
 
 func postV2RequestContext(ctx context.Context, payload []byte) (*v2.Response, error) {
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc"
 	body := payload
 	compressed := false
 	if !flags.DisableCompression {
@@ -269,6 +269,7 @@ func postV2RequestContext(ctx context.Context, payload []byte) (*v2.Response, er
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	authorizeAgentRequest(req, flags.Token)
 	if compressed {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
@@ -380,7 +381,7 @@ func forgetV2Event(id string) {
 func connectWebSocket(websocketEndpoint string) (*ws.SafeConn, error) {
 	dialer := newWSDialer()
 
-	conn, resp, err := dialer.Dial(websocketEndpoint, nil)
+	conn, resp, err := dialer.Dial(websocketEndpoint, agentAuthorizationHeader(flags.Token))
 	if err != nil {
 		if resp != nil && resp.StatusCode != 101 {
 			return nil, &httpStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
@@ -516,7 +517,7 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 
 // establishTerminalConnection 建立终端连接并使用terminal包处理终端操作
 func establishTerminalConnection(token, id, endpoint string) {
-	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/terminal?token=" + token + "&id=" + id
+	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/terminal"
 	endpoint = "ws" + strings.TrimPrefix(endpoint, "http")
 
 	// 转换中文域名为 ASCII 兼容编码
@@ -529,7 +530,9 @@ func establishTerminalConnection(token, id, endpoint string) {
 	// 使用与主 WS 相同的拨号策略
 	dialer := newWSDialer()
 
-	conn, _, err := dialer.Dial(endpoint, nil)
+	headers := agentAuthorizationHeader(token)
+	headers.Set("X-Komari-Terminal-Session", id)
+	conn, _, err := dialer.Dial(endpoint, headers)
 	if err != nil {
 		log.Println("Failed to establish terminal connection:", err)
 		return
@@ -543,15 +546,15 @@ func establishTerminalConnection(token, id, endpoint string) {
 }
 
 func establishRemoteConnection(token, id, ticket, endpoint string) {
-	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/remote?id=" + id
+	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/remote"
 	endpoint = "ws" + strings.TrimPrefix(endpoint, "http")
 	if convertedEndpoint, err := utils.ConvertIDNToASCII(endpoint); err == nil {
 		endpoint = convertedEndpoint
 	} else {
 		log.Printf("Warning: Failed to convert remote WebSocket IDN to ASCII: %v", err)
 	}
-	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+token)
+	headers := agentAuthorizationHeader(token)
+	headers.Set("X-Komari-Remote-Session", id)
 	headers.Set("X-Komari-Remote-Ticket", ticket)
 	conn, _, err := newWSDialer().Dial(endpoint, headers)
 	if err != nil {

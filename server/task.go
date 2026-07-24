@@ -125,7 +125,7 @@ func uploadTaskResult(taskID, result string, exitCode int, finishedAt time.Time)
 	}
 
 	jsonData, _ := json.Marshal(payload)
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/task/result?token=" + flags.Token
+	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/task/result"
 
 	client := dnsresolver.GetHTTPClientWithPreference(30*time.Second, flags.PreferIPVersion)
 	maxRetry := flags.MaxRetries
@@ -136,6 +136,7 @@ func uploadTaskResult(taskID, result string, exitCode int, finishedAt time.Time)
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
+		authorizeAgentRequest(req, flags.Token)
 
 		resp, err := client.Do(req)
 		if resp != nil {
@@ -371,7 +372,7 @@ func postV2RPC(payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
+	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc"
 	compressed := false
 	if !flags.DisableCompression {
 		if gz, err := gzipBytes(body); err == nil {
@@ -384,6 +385,7 @@ func postV2RPC(payload interface{}) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	authorizeAgentRequest(req, flags.Token)
 	if compressed {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
