@@ -60,6 +60,8 @@ func TestNeedUpdate(t *testing.T) {
 		{"1.2.3", "1.2.3-beta", false},
 		{"0.0.5", "0.0.6+build.1", true},
 		{"0.0.6", "v0.0.6+build.1", false},
+		{"2.1.6+65a346e", "2.1.61", true},
+		{"2.1.61+be3daa4", "2.1.61", false},
 	}
 
 	for _, tt := range tests {
@@ -172,6 +174,55 @@ func TestSelectLatestSnapshotReleaseNoMatch(t *testing.T) {
 
 	if got, ok := selectLatestSnapshotRelease(releases, "komari-agent-linux-amd64"); ok {
 		t.Fatalf("selectLatestSnapshotRelease() = %+v, want no candidate", got)
+	}
+}
+
+func TestSelectLatestStableRelease(t *testing.T) {
+	assetName := "komari-agent-linux-amd64"
+	base := time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)
+	releases := []githubRelease{
+		testRelease("2.1.6", false, false, base, assetName),
+		testRelease("Snapshot-2607240100", true, false, base.Add(time.Hour), assetName),
+		testRelease("2.1.61", false, false, base.Add(2*time.Hour), assetName),
+		testRelease("2.2.0", false, true, base.Add(3*time.Hour), assetName),
+		testRelease("not-semver", false, false, base.Add(4*time.Hour), assetName),
+	}
+
+	got, ok := selectLatestStableRelease(releases, assetName)
+	if !ok {
+		t.Fatal("selectLatestStableRelease() found no candidate")
+	}
+	if got.TagName != "2.1.61" {
+		t.Errorf("selectLatestStableRelease() tag = %q, want %q", got.TagName, "2.1.61")
+	}
+	if !got.HasAsset || got.Asset.Name != assetName {
+		t.Errorf("selectLatestStableRelease() asset = %+v, want %q", got.Asset, assetName)
+	}
+}
+
+func TestSelectLatestStableReleaseWaitsForNewestAsset(t *testing.T) {
+	assetName := "komari-agent-linux-amd64"
+	base := time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)
+	releases := []githubRelease{
+		testRelease("2.1.6", false, false, base, assetName),
+		testRelease("2.1.61", false, false, base.Add(time.Hour), "komari-agent-linux-arm64"),
+	}
+
+	got, ok := selectLatestStableRelease(releases, assetName)
+	if !ok {
+		t.Fatal("selectLatestStableRelease() found no candidate")
+	}
+	if got.TagName != "2.1.61" || got.HasAsset {
+		t.Errorf("selectLatestStableRelease() = %+v, want newest release without a ready amd64 asset", got)
+	}
+}
+
+func TestNextCheckDelay(t *testing.T) {
+	if got := nextCheckDelay(false); got != 6*time.Hour {
+		t.Errorf("nextCheckDelay(false) = %s, want 6h", got)
+	}
+	if got := nextCheckDelay(true); got != 15*time.Minute {
+		t.Errorf("nextCheckDelay(true) = %s, want 15m", got)
 	}
 }
 

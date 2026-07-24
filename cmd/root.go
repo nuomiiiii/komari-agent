@@ -122,11 +122,12 @@ var RootCmd = &cobra.Command{
 		}
 		// 自动更新
 		if !flags.DisableAutoUpdate {
-			err := update.CheckAndUpdate()
-			if err != nil {
+			initialUpdateFailed := false
+			if err := update.CheckAndUpdate(); err != nil {
 				log.Println("[ERROR]", err)
+				initialUpdateFailed = true
 			}
-			go update.DoUpdateWorks()
+			go update.DoUpdateWorks(initialUpdateFailed)
 		}
 		go server.DoUploadBasicInfoWorks()
 		for {

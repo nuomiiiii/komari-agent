@@ -55,52 +55,24 @@ func uploadIDFromResponse(t *testing.T, response map[string]any) string {
 	return id
 }
 
-func TestSQLiteProtectionRecognizesNameAndHeader(t *testing.T) {
+func TestSQLiteFilesUseNormalFileOperations(t *testing.T) {
 	directory := t.TempDir()
-	byName := filepath.Join(directory, "metrics.sqlite3")
-	if err := os.WriteFile(byName, []byte("not a database"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	byHeader := filepath.Join(directory, "metrics.data")
-	payload := append([]byte("SQLite format 3\x00"), make([]byte, 32)...)
-	if err := os.WriteFile(byHeader, payload, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{byName, byHeader} {
-		if err := ensureFileAllowed(path); err == nil {
-			t.Fatalf("expected SQLite protection for %s", path)
-		}
-	}
-}
-
-func TestDirectoryWithSQLiteCannotBeRemovedOrRenamed(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "protected")
-	if err := os.Mkdir(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	database := filepath.Join(directory, "komari.db")
-	if err := os.WriteFile(database, []byte("database"), 0o600); err != nil {
+	payload := append([]byte("SQLite format 3\x00"), make([]byte, 32)...)
+	if err := os.WriteFile(database, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	writer := &recordingFileWriter{}
 	manager := newFileManager(writer)
 	defer manager.close()
 
-	manager.remove(fileRequest{Type: "file.delete", ID: "delete", Path: directory, Recursive: true})
-	if responseOK(t, writer.last(t)) {
-		t.Fatal("directory containing SQLite was deleted")
+	destination := filepath.Join(directory, "renamed.db")
+	manager.rename(fileRequest{Type: "file.rename", ID: "rename", Path: database, Destination: destination})
+	if !responseOK(t, writer.last(t)) {
+		t.Fatalf("SQLite file rename failed: %#v", writer.last(t))
 	}
-	if _, err := os.Stat(database); err != nil {
-		t.Fatalf("protected database changed after delete attempt: %v", err)
-	}
-
-	destination := filepath.Join(filepath.Dir(directory), "renamed")
-	manager.rename(fileRequest{Type: "file.rename", ID: "rename", Path: directory, Destination: destination})
-	if responseOK(t, writer.last(t)) {
-		t.Fatal("directory containing SQLite was renamed")
-	}
-	if _, err := os.Stat(database); err != nil {
-		t.Fatalf("protected database changed after rename attempt: %v", err)
+	if content, err := os.ReadFile(destination); err != nil || string(content) != string(payload) {
+		t.Fatalf("renamed SQLite file changed: content=%q err=%v", content, err)
 	}
 }
 
@@ -120,7 +92,97 @@ func TestFilesystemRootCannotBeRenamed(t *testing.T) {
 	}
 }
 
-func TestUploadRejectsDisguisedSQLiteContent(t *testing.T) {
+func TestCopyRegularFile(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source.txt")
+	destination := filepath.Join(directory, "destination.txt")
+	if err := os.WriteFile(source, []byte("copied content"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	writer := &recordingFileWriter{}
+	manager := newFileManager(writer)
+	defer manager.close()
+
+	manager.handle([]byte(`{"type":"file.copy","id":"copy","path":"` + filepath.ToSlash(source) + `","destination":"` + filepath.ToSlash(destination) + `"}`))
+	if !responseOK(t, writer.last(t)) {
+		t.Fatalf("regular file copy failed: %#v", writer.last(t))
+	}
+	content, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "copied content" {
+		t.Fatalf("copied content = %q", content)
+	}
+}
+
+func TestCopyDirectoryRecursively(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	destination := filepath.Join(parent, "destination")
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "notes.txt"), []byte("nested"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPath(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(destination, "nested", "notes.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "nested" {
+		t.Fatalf("copied nested content = %q", content)
+	}
+}
+
+func TestCopyRejectsUnsafeSources(t *testing.T) {
+	parent := t.TempDir()
+	regularDirectory := filepath.Join(parent, "regular-directory")
+	if err := os.Mkdir(regularDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPath(regularDirectory, filepath.Join(regularDirectory, "nested-copy")); err == nil {
+		t.Fatal("directory was copied into itself")
+	}
+
+	regular := filepath.Join(parent, "regular.txt")
+	if err := os.WriteFile(regular, []byte("regular"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(parent, "link.txt")
+	if err := os.Symlink(regular, symlink); err == nil {
+		if err := copyPath(symlink, filepath.Join(parent, "link-copy")); err == nil {
+			t.Fatal("symbolic link was copied")
+		}
+	}
+}
+
+func TestCopyRejectsExistingDestination(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source.txt")
+	destination := filepath.Join(parent, "destination.txt")
+	if err := os.WriteFile(source, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyPath(source, destination); err == nil {
+		t.Fatal("copy replaced an existing destination")
+	}
+	content, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "existing" {
+		t.Fatalf("existing destination changed to %q", content)
+	}
+}
+
+func TestUploadAllowsSQLiteContent(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "innocent.txt")
 	payload := append([]byte("SQLite format 3\x00"), make([]byte, 64)...)
 	writer := &recordingFileWriter{}
@@ -134,11 +196,12 @@ func TestUploadRejectsDisguisedSQLiteContent(t *testing.T) {
 		t.Fatalf("upload chunk failed: %#v", writer.last(t))
 	}
 	manager.finishUpload(fileRequest{Type: "file.upload.finish", ID: "finish", UploadID: uploadID})
-	if responseOK(t, writer.last(t)) {
-		t.Fatal("disguised SQLite upload unexpectedly succeeded")
+	if !responseOK(t, writer.last(t)) {
+		t.Fatalf("SQLite content upload failed: %#v", writer.last(t))
 	}
-	if _, err := os.Stat(target); !os.IsNotExist(err) {
-		t.Fatalf("disguised SQLite upload left a target file: %v", err)
+	content, err := os.ReadFile(target)
+	if err != nil || string(content) != string(payload) {
+		t.Fatalf("uploaded SQLite content changed: content=%q err=%v", content, err)
 	}
 }
 

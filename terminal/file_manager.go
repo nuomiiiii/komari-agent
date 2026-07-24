@@ -113,6 +113,8 @@ func (manager *fileManager) handle(payload []byte) {
 		manager.create(request)
 	case "file.rename":
 		manager.rename(request)
+	case "file.copy":
+		manager.copy(request)
 	case "file.delete":
 		manager.remove(request)
 	case "file.upload.start":
@@ -187,58 +189,6 @@ func isFilesystemRoot(path string) bool {
 	return false
 }
 
-func isSQLiteName(path string) bool {
-	name := strings.ToLower(filepath.Base(path))
-	for _, suffix := range []string{".db", ".db3", ".sqlite", ".sqlite3", ".s3db", "-wal", "-shm", "-journal"} {
-		if strings.HasSuffix(name, suffix) {
-			return true
-		}
-	}
-	return false
-}
-
-func isSQLiteFile(path string) bool {
-	if isSQLiteName(path) {
-		return true
-	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return false
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer file.Close()
-	header := make([]byte, 16)
-	if _, err := io.ReadFull(file, header); err != nil {
-		return false
-	}
-	return string(header) == "SQLite format 3\x00"
-}
-
-func ensureFileAllowed(path string) error {
-	if isSQLiteFile(path) {
-		return errors.New("SQLite database files are protected")
-	}
-	return nil
-}
-
-func directoryContainsSQLite(path string) error {
-	return filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if !entry.IsDir() && isSQLiteFile(current) {
-			return errors.New("directory contains a protected SQLite database")
-		}
-		return nil
-	})
-}
-
 func (manager *fileManager) list(request fileRequest) {
 	path, err := normalizeFilePath(request.Path)
 	if err != nil {
@@ -266,7 +216,7 @@ func (manager *fileManager) list(request fileRequest) {
 			Directory:  entry.IsDir(),
 			Symlink:    entry.Type()&os.ModeSymlink != 0,
 			Hidden:     strings.HasPrefix(entry.Name(), "."),
-			Protected:  !entry.IsDir() && isSQLiteFile(fullPath),
+			Protected:  false,
 		})
 	}
 	sort.Slice(result, func(left, right int) bool {
@@ -286,9 +236,6 @@ func (manager *fileManager) list(request fileRequest) {
 func (manager *fileManager) mkdir(request fileRequest) {
 	path, err := normalizeFilePath(request.Path)
 	if err == nil {
-		err = ensureFileAllowed(path)
-	}
-	if err == nil {
 		err = os.Mkdir(path, 0o755)
 	}
 	manager.respond(request, nil, err)
@@ -296,9 +243,6 @@ func (manager *fileManager) mkdir(request fileRequest) {
 
 func (manager *fileManager) create(request fileRequest) {
 	path, err := normalizeFilePath(request.Path)
-	if err == nil {
-		err = ensureFileAllowed(path)
-	}
 	if err == nil {
 		var file *os.File
 		file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -321,19 +265,6 @@ func (manager *fileManager) rename(request fileRequest) {
 	}
 	destination, err := normalizeFilePath(request.Destination)
 	if err == nil {
-		err = ensureFileAllowed(source)
-	}
-	if err == nil {
-		err = ensureFileAllowed(destination)
-	}
-	if err == nil {
-		if info, statErr := os.Lstat(source); statErr != nil {
-			err = statErr
-		} else if info.IsDir() {
-			err = directoryContainsSQLite(source)
-		}
-	}
-	if err == nil {
 		if _, statErr := os.Lstat(destination); statErr == nil {
 			err = errors.New("destination already exists")
 		} else if !errors.Is(statErr, os.ErrNotExist) {
@@ -346,22 +277,196 @@ func (manager *fileManager) rename(request fileRequest) {
 	manager.respond(request, nil, err)
 }
 
+func (manager *fileManager) copy(request fileRequest) {
+	source, err := normalizeFilePath(request.Path)
+	if err != nil {
+		manager.respond(request, nil, err)
+		return
+	}
+	destination, err := normalizeFilePath(request.Destination)
+	if err == nil {
+		err = copyPath(source, destination)
+	}
+	manager.respond(request, nil, err)
+}
+
+func copyPath(source, destination string) error {
+	if isFilesystemRoot(source) || isFilesystemRoot(destination) {
+		return errors.New("filesystem roots cannot be copied")
+	}
+	sourceInfo, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if sourceInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("symbolic links cannot be copied")
+	}
+	if _, err := os.Lstat(destination); err == nil {
+		return errors.New("destination already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if hasSymlink, err := pathHasSymlink(source); err != nil {
+		return err
+	} else if hasSymlink {
+		return errors.New("paths containing symbolic links cannot be copied")
+	}
+	if hasSymlink, err := pathHasSymlink(filepath.Dir(destination)); err != nil {
+		return err
+	} else if hasSymlink {
+		return errors.New("copy destinations cannot use symbolic links")
+	}
+	resolvedSource, err := filepath.Abs(source)
+	if err != nil {
+		return err
+	}
+	resolvedDestination, err := filepath.Abs(destination)
+	if err != nil {
+		return err
+	}
+	if sourceInfo.IsDir() {
+		if pathContains(resolvedSource, resolvedDestination) {
+			return errors.New("a directory cannot be copied into itself")
+		}
+		if err := validateCopyDirectory(source); err != nil {
+			return err
+		}
+		return copyDirectory(source, destination)
+	}
+	if !sourceInfo.Mode().IsRegular() {
+		return errors.New("only regular files and directories can be copied")
+	}
+	return copyRegularFile(source, destination, sourceInfo.Mode().Perm())
+}
+
+func pathHasSymlink(path string) (bool, error) {
+	current, err := filepath.Abs(path)
+	if err != nil {
+		return false, err
+	}
+	for {
+		info, err := os.Lstat(current)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return false, err
+			}
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			return true, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false, nil
+		}
+		current = parent
+	}
+}
+
+func pathContains(parent, child string) bool {
+	if runtime.GOOS == "windows" {
+		parent = strings.ToLower(parent)
+		child = strings.ToLower(child)
+	}
+	relative, err := filepath.Rel(parent, child)
+	if err != nil || filepath.IsAbs(relative) {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+func validateCopyDirectory(source string) error {
+	return filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("directories containing symbolic links cannot be copied")
+		}
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return errors.New("directories containing special files cannot be copied")
+		}
+		return nil
+	})
+}
+
+func copyDirectory(source, destination string) (err error) {
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if err := os.Mkdir(destination, sourceInfo.Mode().Perm()); err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			err = errors.Join(err, os.RemoveAll(destination))
+		}
+	}()
+	err = filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if current == source {
+			return nil
+		}
+		relative, err := filepath.Rel(source, current)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.Mkdir(target, info.Mode().Perm())
+		}
+		return copyRegularFile(current, target, info.Mode().Perm())
+	})
+	if err != nil {
+		return err
+	}
+	complete = true
+	return nil
+}
+
+func copyRegularFile(source, destination string, mode fs.FileMode) (err error) {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		err = errors.Join(err, output.Close())
+		if !complete {
+			err = errors.Join(err, os.Remove(destination))
+		}
+	}()
+	if _, err = io.Copy(output, input); err != nil {
+		return err
+	}
+	if err = output.Sync(); err != nil {
+		return err
+	}
+	complete = true
+	return nil
+}
+
 func (manager *fileManager) remove(request fileRequest) {
 	path, err := normalizeFilePath(request.Path)
 	if err == nil && isFilesystemRoot(path) {
 		err = errors.New("filesystem roots cannot be deleted")
 	}
 	if err == nil {
-		err = ensureFileAllowed(path)
-	}
-	if err == nil {
 		if info, statErr := os.Lstat(path); statErr != nil {
 			err = statErr
-		} else if info.IsDir() {
-			err = directoryContainsSQLite(path)
-			if err == nil && !request.Recursive {
-				err = errors.New("directory deletion requires recursive confirmation")
-			}
+		} else if info.IsDir() && !request.Recursive {
+			err = errors.New("directory deletion requires recursive confirmation")
 		}
 	}
 	if err == nil {
@@ -478,10 +583,6 @@ func (manager *fileManager) finishUpload(request fileRequest) {
 		manager.respond(request, nil, err)
 		return
 	}
-	if err := ensureFileAllowed(upload.tempPath); err != nil {
-		manager.respond(request, nil, err)
-		return
-	}
 	if err := validateUploadTarget(upload.target, upload.overwrite); err != nil {
 		manager.respond(request, nil, err)
 		return
@@ -520,9 +621,6 @@ func replaceUploadedFile(tempPath, target string, overwrite bool) error {
 }
 
 func validateUploadTarget(target string, overwrite bool) error {
-	if err := ensureFileAllowed(target); err != nil {
-		return err
-	}
 	info, err := os.Lstat(target)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -541,9 +639,6 @@ func validateUploadTarget(target string, overwrite bool) error {
 
 func (manager *fileManager) download(request fileRequest) {
 	path, err := normalizeFilePath(request.Path)
-	if err == nil {
-		err = ensureFileAllowed(path)
-	}
 	var file *os.File
 	var info os.FileInfo
 	if err == nil {

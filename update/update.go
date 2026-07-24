@@ -27,6 +27,8 @@ const (
 	snapshotVersionPrefix = "Snapshot-"
 	containerMarkerPath   = "/.komari-agent-container"
 	githubAPIBaseURL      = "https://api.github.com"
+	regularCheckInterval  = 6 * time.Hour
+	retryCheckInterval    = 15 * time.Minute
 )
 
 type buildTrack int
@@ -61,6 +63,17 @@ type snapshotReleaseCandidate struct {
 	HTMLURL     string
 	PublishedAt time.Time
 	Asset       githubReleaseAsset
+}
+
+type stableReleaseCandidate struct {
+	Version     semver.Version
+	TagName     string
+	Name        string
+	Body        string
+	HTMLURL     string
+	PublishedAt time.Time
+	Asset       githubReleaseAsset
+	HasAsset    bool
 }
 
 // parseVersion 解析可能带有 v/V 前缀，以及预发布或构建元数据的版本字符串
@@ -129,6 +142,40 @@ func selectLatestSnapshotRelease(releases []githubRelease, assetName string) (sn
 			latest = candidate
 			found = true
 		}
+	}
+
+	return latest, found
+}
+
+func selectLatestStableRelease(releases []githubRelease, assetName string) (stableReleaseCandidate, bool) {
+	var latest stableReleaseCandidate
+	found := false
+
+	for _, release := range releases {
+		if release.Draft || release.Prerelease {
+			continue
+		}
+
+		version, err := parseVersion(strings.TrimSpace(release.TagName))
+		if err != nil {
+			continue
+		}
+		if found && version.Compare(latest.Version) <= 0 {
+			continue
+		}
+
+		asset, hasAsset := findReleaseAsset(release, assetName)
+		latest = stableReleaseCandidate{
+			Version:     version,
+			TagName:     release.TagName,
+			Name:        release.Name,
+			Body:        release.Body,
+			HTMLURL:     release.HTMLURL,
+			PublishedAt: release.PublishedAt,
+			Asset:       asset,
+			HasAsset:    hasAsset,
+		}
+		found = true
 	}
 
 	return latest, found
@@ -239,23 +286,74 @@ func selfUpdateReleaseFromSnapshot(owner, repo string, candidate snapshotRelease
 	}
 }
 
-func DoUpdateWorks() {
-	ticker := time.NewTicker(6 * time.Hour)
-	defer ticker.Stop()
-	for range ticker.C {
-		CheckAndUpdate()
+func selfUpdateReleaseFromStable(owner, repo string, candidate stableReleaseCandidate) *selfupdate.Release {
+	publishedAt := candidate.PublishedAt
+	return &selfupdate.Release{
+		Version:           candidate.Version,
+		AssetURL:          candidate.Asset.BrowserDownloadURL,
+		AssetByteSize:     candidate.Asset.Size,
+		AssetID:           candidate.Asset.ID,
+		ValidationAssetID: -1,
+		URL:               candidate.HTMLURL,
+		ReleaseNotes:      candidate.Body,
+		Name:              candidate.Name,
+		PublishedAt:       &publishedAt,
+		RepoOwner:         owner,
+		RepoName:          repo,
+	}
+}
+
+func nextCheckDelay(lastCheckFailed bool) time.Duration {
+	if lastCheckFailed {
+		return retryCheckInterval
+	}
+	return regularCheckInterval
+}
+
+func DoUpdateWorks(initialCheckFailed bool) {
+	lastCheckFailed := initialCheckFailed
+	for {
+		timer := time.NewTimer(nextCheckDelay(lastCheckFailed))
+		<-timer.C
+
+		if err := CheckAndUpdate(); err != nil {
+			log.Println("[ERROR]", err)
+			lastCheckFailed = true
+			continue
+		}
+		lastCheckFailed = false
 	}
 }
 
 func checkAndUpdateStable(currentSemVer semver.Version, updater *selfupdate.Updater) error {
-	latest, err := updater.UpdateSelf(currentSemVer, Repo)
+	owner, repo, err := splitRepoSlug(Repo)
 	if err != nil {
-		return fmt.Errorf("failed to check for updates: %v", err)
+		return err
 	}
 
-	if latest.Version.Equals(currentSemVer) {
+	releases, err := listGitHubReleases(owner, repo)
+	if err != nil {
+		return err
+	}
+
+	assetName := expectedAssetName(runtime.GOOS, runtime.GOARCH)
+	latest, found := selectLatestStableRelease(releases, assetName)
+	if !found || !needUpdate(currentSemVer, latest.Version) {
 		log.Println("Current version is the latest:", CurrentVersion)
 		return nil
+	}
+	if !latest.HasAsset {
+		return fmt.Errorf("release %s is available, but asset %s is not ready; retry in %s", latest.TagName, assetName, retryCheckInterval)
+	}
+
+	cmdPath, err := currentExecutablePath()
+	if err != nil {
+		return fmt.Errorf("failed to resolve current executable path: %w", err)
+	}
+
+	log.Printf("Will update %s from %s to %s\n", cmdPath, CurrentVersion, latest.TagName)
+	if err := updater.UpdateTo(selfUpdateReleaseFromStable(owner, repo, latest), cmdPath); err != nil {
+		return fmt.Errorf("failed to update to stable release %s: %w", latest.TagName, err)
 	}
 	// Default is installed as a service, so don't automatically restart
 	//execPath, err := os.Executable()
